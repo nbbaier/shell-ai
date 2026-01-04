@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
 	. "q/types"
 	"strings"
 	"time"
+
+	"q/logger"
 )
 
 type LLMClient struct {
@@ -18,9 +21,13 @@ type LLMClient struct {
 	StreamCallback func(string, error)
 
 	httpClient *http.Client
+	logger     *logger.RequestLogger
 }
 
 func NewLLMClient(config ModelConfig) *LLMClient {
+	// Initialize logger (best effort, non-fatal if it fails)
+	reqLogger, _ := logger.NewRequestLogger()
+
 	return &LLMClient{
 		config:   config,
 		messages: append([]Message(nil), config.Prompt...),
@@ -28,6 +35,7 @@ func NewLLMClient(config ModelConfig) *LLMClient {
 		httpClient: &http.Client{
 			Timeout: time.Second * 120,
 		},
+		logger: reqLogger,
 	}
 }
 
@@ -53,6 +61,7 @@ func (c *LLMClient) createRequest(payload Payload) (*http.Request, error) {
 }
 
 func (c *LLMClient) Query(query string) (string, error) {
+	startTime := time.Now()
 	messages := c.messages
 	messages = append(messages, Message{Role: "user", Content: query})
 
@@ -61,20 +70,67 @@ func (c *LLMClient) Query(query string) (string, error) {
 		Messages:    messages,
 		Temperature: 0,
 		Stream:      true,
+		StreamOptions: &StreamOptions{IncludeUsage: true},
 	}
 
-	message, err := c.callStream(payload)
+	message, usage, requestID, err := c.callStream(payload)
+	durationMs := time.Since(startTime).Milliseconds()
+
 	if err != nil {
+		// Log error case
+		if c.logger != nil {
+			logEntry := logger.CreateLogEntry(
+				c.config.ModelName,
+				messages,
+				"",
+				usage,
+				requestID,
+				durationMs,
+				err,
+			)
+			if logErr := c.logger.LogResponse(logEntry); logErr != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to write log: %v\n", logErr)
+			}
+		}
 		return "", err
 	}
+
 	c.messages = append(c.messages, message)
+
+	// Log successful case
+	if c.logger != nil {
+		logEntry := logger.CreateLogEntry(
+			c.config.ModelName,
+			messages,
+			message.Content,
+			usage,
+			requestID,
+			durationMs,
+			nil,
+		)
+		if logErr := c.logger.LogResponse(logEntry); logErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to write log: %v\n", logErr)
+		}
+	}
+
 	return message.Content, nil
 }
 
-func (c *LLMClient) processStream(resp *http.Response) (string, error) {
+func (c *LLMClient) processStream(resp *http.Response) (string, struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+}, string, error) {
 	counter := 0
 	streamReader := bufio.NewReader(resp.Body)
 	totalData := ""
+	var usage struct {
+		PromptTokens     int
+		CompletionTokens int
+		TotalTokens      int
+	}
+	var requestID string
+
 	for {
 		line, err := streamReader.ReadString('\n')
 		if err != nil {
@@ -93,6 +149,19 @@ func (c *LLMClient) processStream(resp *http.Response) (string, error) {
 				fmt.Println("Error parsing data:", err)
 				continue
 			}
+
+			// Capture request ID from first chunk
+			if requestID == "" && responseData.ID != "" {
+				requestID = responseData.ID
+			}
+
+			// Capture usage data from final chunk
+			if responseData.Usage.TotalTokens > 0 {
+				usage.PromptTokens = responseData.Usage.PromptTokens
+				usage.CompletionTokens = responseData.Usage.CompletionTokens
+				usage.TotalTokens = responseData.Usage.TotalTokens
+			}
+
 			if len(responseData.Choices) == 0 {
 				continue
 			}
@@ -105,23 +174,33 @@ func (c *LLMClient) processStream(resp *http.Response) (string, error) {
 			counter++
 		}
 	}
-	return totalData, nil
+	return totalData, usage, requestID, nil
 }
 
-func (c *LLMClient) callStream(payload Payload) (Message, error) {
+func (c *LLMClient) callStream(payload Payload) (Message, struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+}, string, error) {
+	var emptyUsage struct {
+		PromptTokens     int
+		CompletionTokens int
+		TotalTokens      int
+	}
+
 	req, err := c.createRequest(payload)
 	if err != nil {
-		return Message{}, fmt.Errorf("failed to create the request: %w", err)
+		return Message{}, emptyUsage, "", fmt.Errorf("failed to create the request: %w", err)
 	}
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return Message{}, fmt.Errorf("failed to make the API request: %w", err)
+		return Message{}, emptyUsage, "", fmt.Errorf("failed to make the API request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return Message{}, fmt.Errorf("API request failed: %s", resp.Status)
+		return Message{}, emptyUsage, "", fmt.Errorf("API request failed: %s", resp.Status)
 	}
-	content, err := c.processStream(resp)
-	return Message{Role: "assistant", Content: content}, err
+	content, usage, requestID, err := c.processStream(resp)
+	return Message{Role: "assistant", Content: content}, usage, requestID, err
 }

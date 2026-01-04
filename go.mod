@@ -12,7 +12,10 @@ require (
 	github.com/spf13/cobra v1.7.0
 )
 
-require github.com/sahilm/fuzzy v0.1.1-0.20230530133925-c48e322e2a8f // indirect
+require (
+	github.com/mattn/go-sqlite3 v1.14.32 // indirect
+	github.com/sahilm/fuzzy v0.1.1-0.20230530133925-c48e322e2a8f // indirect
+)
 
 require (
 	github.com/alecthomas/chroma v0.10.0 // indirect
